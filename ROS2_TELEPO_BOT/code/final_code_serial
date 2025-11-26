@@ -1,0 +1,404 @@
+/*Motor controller using micro_ros serial set_microros_transports*/
+#include <Arduino.h>
+#include <micro_ros_platformio.h>
+#include <stdio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
+#include <std_msgs/msg/int32.h>
+#include <odometry.h>
+#include <nav_msgs/msg/odometry.h>
+#include <geometry_msgs/msg/twist.h>
+#include <geometry_msgs/msg/vector3.h>
+
+// ------------------- pin declaration -------------------
+// Left motor
+int8_t L_RPWM = 26;
+int8_t L_LPWM = 27;
+int8_t L_encoderPin1 = 18;
+int8_t L_encoderPin2 = 21;
+
+// Right motor
+int8_t R_RPWM = 32; // swapped earlier; keep mapping you used
+int8_t R_LPWM = 33;
+int8_t R_encoderPin1 = 15;
+int8_t R_encoderPin2 = 23;
+
+// ------------------- robot params -------------------
+float wheels_y_distance_ = 0.24079;
+float wheel_radius = 0.033;
+float wheel_circumference_ = 2 * 3.14 * wheel_radius;
+//encoder value per revolution of left wheel and right wheel
+int tickPerRevolution_LW = 3140;
+int tickPerRevolution_RW = 3140;
+int threshold = 80;
+//pid constants of left wheel
+float kp_l = 20;
+float ki_l = 0;
+float kd_l = 0;
+//pid constants of right wheel
+float kp_r = 20;
+float ki_r = 0;
+float kd_r = 0;
+
+//pwm parameters setup
+const int freq = 30000;
+const int resolution = 8;
+
+// ------------------- micro-ROS & ROS2 objects -------------------
+rcl_subscription_t subscriber;
+geometry_msgs__msg__Twist msg;
+rclc_executor_t executor;
+rcl_allocator_t allocator;
+rclc_support_t support;
+rcl_node_t node;
+rcl_publisher_t odom_publisher;
+std_msgs__msg__Int32 encodervalue_l;
+std_msgs__msg__Int32 encodervalue_r;
+nav_msgs__msg__Odometry odom_msg;
+rcl_timer_t timer;
+rcl_timer_t ControlTimer;
+unsigned long long time_offset = 0;
+unsigned long prev_cmd_time = 0;
+unsigned long prev_odom_update = 0;
+Odometry odometry;
+
+// ------------------- safety / control tuning -------------------
+const unsigned long CMD_TIMEOUT_MS = 100;     // stop if no cmd in 200 ms
+const unsigned long REVERSAL_SAFETY_MS = 10;  // short stop when reversing
+const float PWM_RAMP_STEP = 20.0;             // max change in PWM per control tick
+const unsigned int samplingT = 10;            // control timer in ms
+
+// ------------------- MotorController class -------------------
+class MotorController {
+public:
+  int8_t RPWM;   // Forward PWM pin
+  int8_t LPWM;   // Backward PWM pin
+  int8_t EncoderPinA;
+  int8_t EncoderPinB;
+  std_msgs__msg__Int32 EncoderCount;
+  volatile long CurrentPosition;
+  volatile long PreviousPosition;
+  volatile long CurrentTime;
+  volatile long PreviousTime;
+  volatile long CurrentTimeforError;
+  volatile long PreviousTimeForError;
+  float rpmFilt;
+  float eintegral;
+  float ederivative;
+  float rpmPrev;
+  float kp;
+  float ki;
+  float kd;
+  float error;
+  float previousError = 0;
+  int tick;
+  int pwmChannelF;
+  int pwmChannelB;
+  float previousActSignal = 0.0f; // store previous actuating signal
+  float lastAppliedPWM = 0.0f;    // last applied PWM magnitude with sign
+
+  MotorController(int8_t RPWM_Pin, int8_t LPWM_Pin, int8_t EncoderA, int8_t EncoderB, int tickPerRevolution, int pwmChanF, int pwmChanB) {
+    this->RPWM = RPWM_Pin;
+    this->LPWM = LPWM_Pin;
+    this->EncoderPinA = EncoderA;
+    this->EncoderPinB = EncoderB;
+    this->tick = tickPerRevolution;
+    this->pwmChannelF = pwmChanF;
+    this->pwmChannelB = pwmChanB;
+    pinMode(RPWM, OUTPUT);
+    pinMode(LPWM, OUTPUT);
+    pinMode(EncoderPinA, INPUT);
+    pinMode(EncoderPinB, INPUT);
+    EncoderCount.data = 0;
+    CurrentPosition = PreviousPosition = 0;
+    PreviousTime = millis();
+    PreviousTimeForError = millis();
+    rpmFilt = 0;
+    eintegral = 0;
+    previousActSignal = 0;
+    lastAppliedPWM = 0;
+  }
+
+  void initPID(float proportionalGain, float integralGain, float derivativeGain) {
+    kp = proportionalGain;
+    ki = integralGain;
+    kd = derivativeGain;
+  }
+
+  float getRpm() {
+    CurrentPosition = EncoderCount.data;
+    CurrentTime = millis();
+    float delta1 = ((float)CurrentTime - PreviousTime) / 1.0e3;
+    if (delta1 <= 0.0) delta1 = 0.001;
+    float velocity = ((float)CurrentPosition - PreviousPosition) / delta1;
+    float rpm = (velocity / tick) * 60;
+
+    // smoothing
+    rpmFilt = 0.7f * rpmFilt + 0.3f * rpm;
+
+    rpmPrev = rpm;
+    PreviousPosition = CurrentPosition;
+    PreviousTime = CurrentTime;
+    return rpmFilt;
+  }
+
+  float pid(float setpoint, float feedback) {
+    CurrentTimeforError = millis();
+    float delta2 = ((float)CurrentTimeforError - PreviousTimeForError) / 1.0e3;
+    if (delta2 <= 0.0) delta2 = 0.001;
+    error = setpoint - feedback;
+    eintegral += (error * delta2);
+    // anti-windup clamp
+    if (eintegral > 10000) eintegral = 10000;
+    if (eintegral < -10000) eintegral = -10000;
+    ederivative = (error - previousError) / delta2;
+    float control_signal = (kp * error) + (ki * eintegral) + (kd * ederivative);
+    previousError = error;
+    PreviousTimeForError = CurrentTimeforError;
+    return control_signal;
+  }
+
+  // moveBase now includes reversal safety + simple ramping
+  void moveBase(float ActuatingSignal, int threshold) {
+    // ramp target actuating signal (limit change rate per call)
+    float target = ActuatingSignal;
+    float prev = previousActSignal;
+    float delta = target - prev;
+    if (fabs(delta) > PWM_RAMP_STEP) {
+      target = prev + (delta > 0 ? PWM_RAMP_STEP : -PWM_RAMP_STEP);
+    }
+    previousActSignal = target; // update stored target
+
+    // detect reversal (sign change) compared to last applied PWM
+    if ((lastAppliedPWM > 0 && target < 0) || (lastAppliedPWM < 0 && target > 0)) {
+      // safety: zero outputs briefly before reversing
+      ledcWrite(pwmChannelF, 0);
+      ledcWrite(pwmChannelB, 0);
+      delay(REVERSAL_SAFETY_MS);
+      lastAppliedPWM = 0;
+    }
+
+    // apply with threshold offset and clamp
+    int pwm = threshold + (int)fabs(target);
+    if (pwm > 255) pwm = 255;
+
+    if (target > 0) {
+      ledcWrite(pwmChannelF, pwm);
+      ledcWrite(pwmChannelB, 0);
+      lastAppliedPWM = pwm;
+    } else if (target < 0) {
+      ledcWrite(pwmChannelF, 0);
+      ledcWrite(pwmChannelB, pwm);
+      lastAppliedPWM = -pwm;
+    } else {
+      ledcWrite(pwmChannelF, 0);
+      ledcWrite(pwmChannelB, 0);
+      lastAppliedPWM = 0;
+    }
+  }
+
+  void stop() {
+    ledcWrite(pwmChannelF, 0);
+    ledcWrite(pwmChannelB, 0);
+    previousActSignal = 0;
+    lastAppliedPWM = 0;
+  }
+};
+
+// instantiate motors (note: keep pin order as your wiring)
+MotorController leftWheel(L_RPWM, L_LPWM, L_encoderPin1, L_encoderPin2, tickPerRevolution_LW, 0, 1);
+MotorController rightWheel(R_RPWM, R_LPWM, R_encoderPin1, R_encoderPin2, tickPerRevolution_RW, 2, 3);
+
+
+#define LED_PIN 2
+#define RCCHECK(fn) \
+  { \
+    rcl_ret_t temp_rc = fn; \
+    if ((temp_rc != RCL_RET_OK)) { error_loop(); } \
+  }
+#define RCSOFTCHECK(fn) \
+  { \
+    rcl_ret_t temp_rc = fn; \
+    if ((temp_rc != RCL_RET_OK)) { error_loop(); } \
+  }
+
+void error_loop() {
+  while (1) {
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    delay(100);
+  }
+}
+
+// interrupts (you currently use single-edge interrupts — keep same behavior)
+void updateEncoderL() {
+  if (digitalRead(leftWheel.EncoderPinB) > digitalRead(leftWheel.EncoderPinA))
+    leftWheel.EncoderCount.data++;
+  else
+    leftWheel.EncoderCount.data--;
+  encodervalue_l = leftWheel.EncoderCount;
+}
+
+void updateEncoderR() {
+  if (digitalRead(rightWheel.EncoderPinA) > digitalRead(rightWheel.EncoderPinB))
+    rightWheel.EncoderCount.data++;
+  else
+    rightWheel.EncoderCount.data--;
+  encodervalue_r = rightWheel.EncoderCount;
+}
+
+// time sync helpers (unchanged)
+void syncTime() {
+  unsigned long now = millis();
+  RCCHECK(rmw_uros_sync_session(10));
+  unsigned long long ros_time_ms = rmw_uros_epoch_millis();
+  time_offset = ros_time_ms - now;
+}
+
+struct timespec getTime() {
+  struct timespec tp = { 0 };
+  unsigned long long now = millis() + time_offset;
+  tp.tv_sec = now / 1000;
+  tp.tv_nsec = (now % 1000) * 1000000;
+  return tp;
+}
+
+// publishes odom (unchanged)
+void publishData() {
+  odom_msg = odometry.getData();
+  struct timespec time_stamp = getTime();
+  odom_msg.header.stamp.sec = time_stamp.tv_sec;
+  odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+  RCSOFTCHECK(rcl_publish(&odom_publisher, &odom_msg, NULL));
+}
+
+// ------------------- MOTOR CONTROL CALLBACK -------------------
+void MotorControll_callback(rcl_timer_t* timer, int64_t last_call_time) {
+  // read cmd_vel values that were written into msg by executor
+  float linearVelocity = msg.linear.x;
+  float angularVelocity = msg.angular.z;
+
+  // implement cmd timeout: if last cmd older than timeout -> zero velocities
+  unsigned long now = millis();
+  if ((now - prev_cmd_time) > CMD_TIMEOUT_MS) {
+    linearVelocity = 0.0f;
+    angularVelocity = 0.0f;
+  }
+
+  // convert cmd_vel to wheel setpoints (you used *20 earlier)
+  float vL = (linearVelocity - (angularVelocity * 1.0f / 2.0f)) * 20.0f;
+  float vR = (linearVelocity + (angularVelocity * 1.0f / 2.0f)) * 20.0f;
+
+  // current wheel rpm
+  float currentRpmL = leftWheel.getRpm();
+  float currentRpmR = rightWheel.getRpm();
+
+  // pid controlled actuating signals
+  float actuating_signal_LW = leftWheel.pid(vL, currentRpmL);
+  float actuating_signal_RW = rightWheel.pid(vR, currentRpmR);
+
+  // if both targets zero -> stop quickly
+  if (fabs(vL) < 1e-3 && fabs(vR) < 1e-3) {
+    leftWheel.stop();
+    rightWheel.stop();
+    leftWheel.previousActSignal = 0;
+    rightWheel.previousActSignal = 0;
+  } else {
+    // apply motors with smoothing and reversal safety built-in
+    leftWheel.moveBase(actuating_signal_LW, threshold);
+    rightWheel.moveBase(actuating_signal_RW, threshold);
+  }
+
+  // odometry (unchanged)
+  float average_rps_x = ((float)(currentRpmL + currentRpmR) / 2) / 60.0;  // RPM -> RPS
+  float linear_x = average_rps_x * wheel_circumference_;
+  float average_rps_a = ((float)(-currentRpmL + currentRpmR) / 2) / 60.0;
+  float angular_z = (average_rps_a * wheel_circumference_) / (wheels_y_distance_ / 2.0);
+  float linear_y = 0;
+  float vel_dt = (now - prev_odom_update) / 1000.0;
+  prev_odom_update = now;
+  odometry.update(vel_dt, linear_x, linear_y, angular_z);
+  publishData();
+}
+
+// subscription callback: update command timestamp (executor already copies incoming msg into global 'msg')
+void subscription_callback(const void* msgin) {
+  // msgin is already copied into 'msg' by rclc executor with ON_NEW_DATA
+  prev_cmd_time = millis();
+}
+
+// ------------------- setup -------------------
+void setup() {
+  // init PID constants
+  leftWheel.initPID(kp_l, ki_l, kd_l);
+  rightWheel.initPID(kp_r, ki_r, kd_r);
+
+  // attach interrupts (keep same pins as before)
+  attachInterrupt(digitalPinToInterrupt(leftWheel.EncoderPinB), updateEncoderL, RISING);
+  attachInterrupt(digitalPinToInterrupt(rightWheel.EncoderPinA), updateEncoderR, RISING);
+
+  // pwm channels
+  ledcSetup(0, freq, resolution);
+  ledcAttachPin(L_RPWM, 0);
+  ledcSetup(1, freq, resolution);
+  ledcAttachPin(L_LPWM, 1);
+
+  ledcSetup(2, freq, resolution);
+  ledcAttachPin(R_RPWM, 2);
+  ledcSetup(3, freq, resolution);
+  ledcAttachPin(R_LPWM, 3);
+
+  Serial.begin(115200);
+  set_microros_serial_transports(Serial);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  delay(2000);
+
+  allocator = rcl_get_default_allocator();
+
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+  RCCHECK(rclc_node_init_default(&node, "micro_ros_esp32_node", "", &support));
+
+  // subscriber for cmd_vel
+  RCCHECK(rclc_subscription_init_default(
+    &subscriber,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+    "/diff_drive_controller/cmd_vel_unstamped"));
+
+  // odom publisher
+  RCCHECK(rclc_publisher_init_default(
+    &odom_publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    "odom"));
+
+  // control timer at samplingT ms
+  RCCHECK(rclc_timer_init_default(
+    &ControlTimer,
+    &support,
+    RCL_MS_TO_NS(samplingT),
+    MotorControll_callback));
+
+  // executor: note size 2 is okay, but we must spin it often
+  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, &subscription_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_timer(&executor, &ControlTimer));
+}
+
+// ------------------- loop -------------------
+void loop() {
+  // spin executor often with small timeout so new cmd_vel gets processed immediately
+  // use RCL_MS_TO_NS(10) to keep latency low
+  RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5)));
+
+  // Light print of encoder counts — avoid long delays here
+  Serial.print("L: "); Serial.print(leftWheel.EncoderCount.data);
+  Serial.print("   R: "); Serial.println(rightWheel.EncoderCount.data);
+
+  // small delay to reduce serial spam but keep responsiveness
+  delay(10);
+}
